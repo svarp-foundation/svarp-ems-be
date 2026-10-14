@@ -35,6 +35,6 @@ fi
 
 # 4. Restart the backend systemd service
 echo "Restarting the backend service..."
-sudo systemctl restart exam-portal-be || sudo systemctl restart portal-exam-be
+sudo systemctl restart svarp-ems-be || sudo systemctl restart portal-exam-be
 
 echo "=== Backend Deployment Completed Successfully ==="
