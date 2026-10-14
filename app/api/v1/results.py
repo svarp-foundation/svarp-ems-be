@@ -53,7 +53,7 @@ def export_exam_results(
     db: Session = Depends(get_db),
     current_user: UserInfo = Depends(require_admin),
 ):
-    """Download exam results as CSV."""
+    """Download exam results as CSV with stream-wise columns."""
     try:
         csv_data = result_service.generate_csv_export(db, exam_id)
     except ValueError as e:
@@ -63,6 +63,25 @@ def export_exam_results(
         content=csv_data,
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=exam_{exam_id}_results.csv"},
+    )
+
+
+@router.get("/exam/{exam_id}/export-excel")
+def export_exam_results_excel(
+    exam_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: UserInfo = Depends(require_admin),
+):
+    """Download exam results as professional Excel (.xlsx) workbook with stream-wise columns."""
+    try:
+        excel_bytes = result_service.generate_excel_export(db, exam_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=exam_{exam_id}_results.xlsx"},
     )
 
 

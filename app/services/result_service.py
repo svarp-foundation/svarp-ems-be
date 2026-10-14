@@ -536,55 +536,215 @@ class ResultService:
         db.refresh(pub)
         return pub
 
+    def _get_exam_streams_metadata(self, db: Session, exam_id: UUID, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collect ordered unique streams with names, codes, and max marks for this exam."""
+        from app.models.exam import ExamStream
+        streams_list = []
+        seen_ids = set()
+
+        # First collect streams from student result details (has exact total_marks calculated)
+        for r in results:
+            for sd in r.get("stream_details", []):
+                sid_str = str(sd.get("stream_id"))
+                if sid_str and sid_str not in seen_ids:
+                    seen_ids.add(sid_str)
+                    streams_list.append({
+                        "stream_id": sid_str,
+                        "stream_name": sd.get("stream_name") or "Subject Stream",
+                        "stream_code": sd.get("stream_code") or "STREAM",
+                        "total_marks": sd.get("total_marks") or 0.0,
+                    })
+
+        # Supplement from configured exam streams if not already present
+        es_rows = (
+            db.query(ExamStream)
+            .options(joinedload(ExamStream.stream))
+            .filter(ExamStream.exam_id == exam_id)
+            .order_by(ExamStream.created_at.asc())
+            .all()
+        )
+        for es in es_rows:
+            sid_str = str(es.stream_id)
+            if sid_str not in seen_ids:
+                seen_ids.add(sid_str)
+                calc_marks = float((es.question_count or 0) * (es.marks_per_question or 1.0))
+                streams_list.append({
+                    "stream_id": sid_str,
+                    "stream_name": es.stream.name if es.stream else "Subject Stream",
+                    "stream_code": es.stream.code if es.stream else "STREAM",
+                    "total_marks": calc_marks,
+                })
+
+        return streams_list
+
     def generate_csv_export(self, db: Session, exam_id: UUID) -> str:
-        """Export ranked candidate results to CSV format."""
+        """Export ranked candidate results to CSV format with dedicated stream-wise columns (Format A)."""
         results = self.get_exam_results(db, exam_id)
         exam = db.query(Exam).filter(Exam.id == exam_id).first()
         exam_title = exam.title if exam else "Exam"
 
+        streams_list = self._get_exam_streams_metadata(db, exam_id, results)
+
         output = io.StringIO()
         writer = csv.writer(output)
 
-        # Header
-        writer.writerow(
-            [
-                "Rank",
-                "Student Email",
-                "Exam Title",
-                "Score Obtained",
-                "Total Marks",
-                "Percentage",
-                "Status",
-                "Correct",
-                "Incorrect",
-                "Unanswered",
-                "Streams Breakdown",
-            ]
-        )
+        # Header with dedicated stream columns
+        header = [
+            "Rank",
+            "Student Email",
+            "Exam Title",
+            "Score Obtained",
+            "Total Marks",
+            "Percentage",
+            "Status",
+        ]
+        for s in streams_list:
+            header.append(f"{s['stream_name']} ({s['stream_code']} - Max {s['total_marks']})")
+
+        header.extend(["Correct", "Incorrect", "Unanswered"])
+        writer.writerow(header)
 
         for r in results:
-            streams_str = "; ".join(
-                f"{sd['stream_code']}: {sd['obtained_marks']}/{sd['total_marks']}"
-                for sd in r["stream_details"]
-            )
             status_str = "Passed" if r["passed"] is True else "Failed" if r["passed"] is False else "Completed"
+            st_score_map = {str(sd["stream_id"]): sd["obtained_marks"] for sd in r.get("stream_details", [])}
 
-            writer.writerow(
-                [
-                    r["rank"],
-                    r["student_email"],
-                    exam_title,
-                    r["total_obtained"],
-                    r["total_marks"],
-                    f"{r['percentage']}%",
-                    status_str,
-                    r["correct_count"],
-                    r["incorrect_count"],
-                    r["unanswered_count"],
-                    streams_str,
-                ]
-            )
+            row = [
+                r["rank"],
+                r["student_email"],
+                exam_title,
+                r["total_obtained"],
+                r["total_marks"],
+                f"{r['percentage']}%",
+                status_str,
+            ]
+            for s in streams_list:
+                row.append(st_score_map.get(s["stream_id"], 0.0))
 
+            row.extend([
+                r["correct_count"],
+                r["incorrect_count"],
+                r["unanswered_count"],
+            ])
+            writer.writerow(row)
+
+        return output.getvalue()
+
+    def generate_excel_export(self, db: Session, exam_id: UUID) -> bytes:
+        """Export ranked candidate results to professionally styled Excel (.xlsx) format with dedicated stream columns (Format A)."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        results = self.get_exam_results(db, exam_id)
+        exam = db.query(Exam).filter(Exam.id == exam_id).first()
+        exam_title = exam.title if exam else "Exam"
+
+        streams_list = self._get_exam_streams_metadata(db, exam_id, results)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Exam Results"
+
+        # Theme styling
+        header_fill = PatternFill(start_color="1F3B45", end_color="1F3B45", fill_type="solid")
+        stream_header_fill = PatternFill(start_color="0F766E", end_color="0F766E", fill_type="solid")
+        header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        regular_font = Font(name="Arial", size=10)
+        center_align = Alignment(horizontal="center", vertical="center")
+        left_align = Alignment(horizontal="left", vertical="center")
+        right_align = Alignment(horizontal="right", vertical="center")
+
+        thin_border = Border(
+            left=Side(style="thin", color="E2E8F0"),
+            right=Side(style="thin", color="E2E8F0"),
+            top=Side(style="thin", color="E2E8F0"),
+            bottom=Side(style="thin", color="E2E8F0"),
+        )
+
+        headers = [
+            "Rank",
+            "Student Email",
+            "Exam Title",
+            "Score Obtained",
+            "Total Marks",
+            "Percentage",
+            "Status",
+        ]
+        stream_col_start = len(headers) + 1
+        for s in streams_list:
+            headers.append(f"{s['stream_name']} ({s['stream_code']} - Max {s['total_marks']})")
+        stream_col_end = len(headers)
+
+        headers.extend(["Correct", "Incorrect", "Unanswered"])
+        ws.append(headers)
+
+        # Style Header Row
+        for col_idx, cell in enumerate(ws[1], start=1):
+            cell.font = header_font
+            if stream_col_start <= col_idx <= stream_col_end:
+                cell.fill = stream_header_fill
+            else:
+                cell.fill = header_fill
+            cell.alignment = center_align
+            cell.border = thin_border
+        ws.row_dimensions[1].height = 28
+
+        # Data Rows
+        for r in results:
+            status_str = "Passed" if r["passed"] is True else "Failed" if r["passed"] is False else "Completed"
+            st_score_map = {str(sd["stream_id"]): sd["obtained_marks"] for sd in r.get("stream_details", [])}
+
+            row_data = [
+                r["rank"],
+                r["student_email"],
+                exam_title,
+                r["total_obtained"],
+                r["total_marks"],
+                f"{r['percentage']}%",
+                status_str,
+            ]
+            for s in streams_list:
+                row_data.append(st_score_map.get(s["stream_id"], 0.0))
+
+            row_data.extend([
+                r["correct_count"],
+                r["incorrect_count"],
+                r["unanswered_count"],
+            ])
+            ws.append(row_data)
+
+            row_idx = ws.max_row
+            for col_idx, cell in enumerate(ws[row_idx], start=1):
+                cell.font = regular_font
+                cell.border = thin_border
+                if col_idx in [1, 6, 7]:
+                    cell.alignment = center_align
+                elif col_idx in [2, 3]:
+                    cell.alignment = left_align
+                else:
+                    cell.alignment = right_align
+
+            # Highlight status cell
+            status_cell = ws.cell(row=row_idx, column=7)
+            if status_str == "Passed":
+                status_cell.font = Font(name="Arial", size=10, bold=True, color="047857")
+            elif status_str == "Failed":
+                status_cell.font = Font(name="Arial", size=10, bold=True, color="B91C1C")
+
+            ws.row_dimensions[row_idx].height = 20
+
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                val_str = str(cell.value or "")
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+        output = io.BytesIO()
+        wb.save(output)
         return output.getvalue()
 
 
