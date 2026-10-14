@@ -29,12 +29,12 @@ def get_audit_logs(
 ):
     """List administrative and security audit trail logs with filtering."""
     query = db.query(AuditLog)
-    if action:
-        query = query.filter(AuditLog.action == action)
-    if actor_email:
-        query = query.filter(AuditLog.actor_email.ilike(f"%{actor_email}%"))
-    if target_type:
-        query = query.filter(AuditLog.target_type == target_type)
+    if action and action.strip() and action.strip().lower() not in ["undefined", "null", "all"]:
+        query = query.filter(AuditLog.action == action.strip())
+    if actor_email and actor_email.strip() and actor_email.strip().lower() not in ["undefined", "null"]:
+        query = query.filter(AuditLog.actor_email.ilike(f"%{actor_email.strip()}%"))
+    if target_type and target_type.strip() and target_type.strip().lower() not in ["undefined", "null", "all"]:
+        query = query.filter(AuditLog.target_type == target_type.strip())
 
     return query.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -50,8 +50,8 @@ def get_proctoring_events(
 ):
     """List proctoring telemetry events (tab switches, fullscreen exits, blur)."""
     query = db.query(ExamEvent)
-    if event_type:
-        query = query.filter(ExamEvent.event_type == event_type)
+    if event_type and event_type.strip() and event_type.strip().lower() not in ["undefined", "null", "all"]:
+        query = query.filter(ExamEvent.event_type == event_type.strip())
     if attempt_id:
         query = query.filter(ExamEvent.attempt_id == attempt_id)
 

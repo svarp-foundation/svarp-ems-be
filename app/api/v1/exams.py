@@ -2,7 +2,7 @@
 
 from uuid import UUID
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile, File
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.middleware.auth import get_current_user, RoleChecker
@@ -15,6 +15,7 @@ from app.schemas.exam import (
     ExamValidationReport,
     EnrollmentBatchCreate,
     EnrollmentResponse,
+    EnrollmentFileValidationResponse,
     PreviewPaperResponse,
 )
 from app.services.exam_service import exam_service
@@ -195,6 +196,44 @@ def get_enrollments(
     """List enrolled students for an exam."""
     enrollments = exam_service.get_enrollments(db, exam_id)
     return enrollments
+
+
+@router.get("/enroll/template")
+@router.get("/{exam_id}/enroll/template")
+def download_candidate_template(
+    current_user: UserInfo = Depends(require_admin),
+):
+    """Download a CSV sample template for candidate batch enrollment."""
+    csv_content = "email\nstudent1@svarp.org\nstudent2@svarp.org\nintern.candidate@svarp.org\n"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=candidate_enrollment_template.csv"},
+    )
+
+
+@router.post("/{exam_id}/enroll/validate-file", response_model=EnrollmentFileValidationResponse)
+async def validate_candidate_enrollment_file(
+    exam_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: UserInfo = Depends(require_admin),
+):
+    """Validate candidates in an uploaded CSV or Excel file against SVARP User Portal before enrollment."""
+    filename = file.filename or ""
+    if not (filename.lower().endswith(".csv") or filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file format. Please upload a CSV (.csv) or Excel (.xlsx, .xls) file.",
+        )
+    file_bytes = await file.read()
+    try:
+        report = exam_service.validate_candidate_file(db, exam_id, file_bytes, filename)
+        return report
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process candidate file: {str(e)}")
 
 
 @router.post("/{exam_id}/enroll")

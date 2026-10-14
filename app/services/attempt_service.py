@@ -472,12 +472,12 @@ class AttemptService:
                 or 0
             )
 
-            # Auto-lock if threshold reached (e.g. 3 switches or fullscreen escape)
+            # Auto-lock immediately on 1st violation or forced lock
             is_forced = bool(details and details.get("force_lock"))
-            if violation_count >= 3 or is_forced:
+            if violation_count >= 1 or is_forced:
                 attempt.is_locked = True
                 attempt.state = AttemptState.INTERRUPTED
-                attempt.lock_reason = f"Security Violation: {violation_count} focus-loss / fullscreen interruptions detected"
+                attempt.lock_reason = f"Security Violation: Focus-loss or fullscreen exit detected ({event_type.replace('_', ' ')})"
 
         db.commit()
         return {"logged": True, "is_locked": attempt.is_locked, "lock_reason": attempt.lock_reason}

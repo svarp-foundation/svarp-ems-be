@@ -3,6 +3,10 @@
 import logging
 import random
 import secrets
+import io
+import csv
+import re
+import openpyxl
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from uuid import UUID
@@ -21,6 +25,8 @@ from app.schemas.exam import (
     QuotaCheckResult,
     PreviewPaperResponse,
     PreviewPaperQuestion,
+    CandidateValidationItem,
+    EnrollmentFileValidationResponse,
 )
 from app.services.portal_user_client import portal_user_client
 
@@ -239,20 +245,46 @@ class ExamService:
         if not exam:
             return None
 
-        if exam.status in [ExamStatus.PUBLISHED, ExamStatus.IN_PROGRESS, ExamStatus.COMPLETED]:
+        # Disallow editing once exam is in progress or completed
+        if exam.status in [ExamStatus.IN_PROGRESS, ExamStatus.COMPLETED]:
             raise ValueError(f"Cannot edit exam in {exam.status} state. Structural settings are locked.")
+
+        # Disallow editing once scheduled start time has passed
+        now = datetime.now(timezone.utc)
+        if exam.start_time:
+            start_tz = exam.start_time
+            if start_tz.tzinfo is None:
+                start_tz = start_tz.replace(tzinfo=timezone.utc)
+            if now >= start_tz:
+                raise ValueError("Cannot edit exam: the scheduled exam start time has already arrived.")
+
+        # Disallow editing if any candidate attempts have already started
+        has_attempts = db.query(Attempt.id).filter(Attempt.exam_id == exam.id).first() is not None
+        if has_attempts:
+            raise ValueError("Cannot edit exam: candidate attempts have already begun.")
+
+        was_published = (exam.status == ExamStatus.PUBLISHED)
+        was_validated = (exam.status == ExamStatus.VALIDATED)
 
         # Update basic fields
         update_dict = data.model_dump(exclude_unset=True)
         streams_data = update_dict.pop("exam_streams", None)
+        update_dict.pop("easy_percentage", None)
+        update_dict.pop("medium_percentage", None)
+        update_dict.pop("hard_percentage", None)
 
         for field, value in update_dict.items():
             setattr(exam, field, value)
 
         # If stream allocations provided, re-create them
         if streams_data is not None:
-            # Delete old exam_streams
-            db.query(ExamStream).filter(ExamStream.exam_id == exam.id).delete()
+            # Delete old difficulty quotas & exam_streams safely
+            existing_stream_ids = [s.id for s in exam.exam_streams]
+            if existing_stream_ids:
+                db.query(DifficultyQuota).filter(
+                    DifficultyQuota.exam_stream_id.in_(existing_stream_ids)
+                ).delete(synchronize_session=False)
+            db.query(ExamStream).filter(ExamStream.exam_id == exam.id).delete(synchronize_session=False)
             db.flush()
 
             for es_in in data.exam_streams or []:
@@ -304,8 +336,21 @@ class ExamService:
                         )
                         db.add(dq)
 
-            # Revert to DRAFT for re-validation
-            exam.status = ExamStatus.DRAFT
+            # Re-validate quotas and retain PUBLISHED/VALIDATED status if quotas still satisfied
+            db.flush()
+            report = self.validate_exam_quotas(db, exam.id)
+            if was_published:
+                if report.is_valid:
+                    exam.status = ExamStatus.PUBLISHED
+                else:
+                    exam.status = ExamStatus.DRAFT
+            elif was_validated:
+                if report.is_valid:
+                    exam.status = ExamStatus.VALIDATED
+                else:
+                    exam.status = ExamStatus.DRAFT
+            else:
+                exam.status = ExamStatus.DRAFT
 
         db.commit()
         db.refresh(exam)
@@ -553,6 +598,187 @@ class ExamService:
         enrollment.status = EnrollmentStatus.WITHDRAWN
         db.commit()
         return True
+
+    def _parse_emails_from_file(self, file_bytes: bytes, filename: str) -> List[str]:
+        """Extract valid email candidates from CSV or XLSX/XLS file."""
+        is_excel = filename.lower().endswith(".xlsx") or filename.lower().endswith(".xls")
+        raw_emails: List[str] = []
+
+        if is_excel:
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+            sheet = wb.active
+            headers = [
+                str(cell.value).strip().lower() if cell.value is not None else ""
+                for cell in sheet[1]
+            ]
+            email_col_idx = None
+            for idx, h in enumerate(headers):
+                if "email" in h:
+                    email_col_idx = idx
+                    break
+
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                if not any(row):
+                    continue
+                if email_col_idx is not None and email_col_idx < len(row):
+                    val = str(row[email_col_idx]).strip() if row[email_col_idx] is not None else ""
+                    if val and "@" in val:
+                        raw_emails.append(val)
+                else:
+                    for cell in row:
+                        val = str(cell).strip() if cell is not None else ""
+                        if val and "@" in val:
+                            raw_emails.append(val)
+                            break
+        else:
+            text_content = file_bytes.decode("utf-8-sig", errors="ignore")
+            try:
+                reader = csv.reader(io.StringIO(text_content))
+                rows = list(reader)
+                if rows:
+                    headers = [h.strip().lower() for h in rows[0]]
+                    email_col_idx = None
+                    for idx, h in enumerate(headers):
+                        if "email" in h:
+                            email_col_idx = idx
+                            break
+
+                    start_idx = 1 if email_col_idx is not None else 0
+                    for row in rows[start_idx:]:
+                        if not row or not any(row):
+                            continue
+                        if email_col_idx is not None and email_col_idx < len(row):
+                            val = row[email_col_idx].strip()
+                            if val and "@" in val:
+                                raw_emails.append(val)
+                        else:
+                            for cell in row:
+                                val = cell.strip()
+                                if val and "@" in val:
+                                    raw_emails.append(val)
+                                    break
+            except Exception:
+                for line in text_content.splitlines():
+                    clean = line.strip().strip(",;\"'")
+                    if "@" in clean:
+                        raw_emails.append(clean)
+
+        # Deduplicate preserving order
+        seen = set()
+        deduped = []
+        for em in raw_emails:
+            clean = em.strip().lower()
+            if clean and clean not in seen:
+                seen.add(clean)
+                deduped.append(clean)
+        return deduped
+
+    def validate_candidate_file(
+        self, db: Session, exam_id: UUID, file_bytes: bytes, filename: str
+    ) -> Dict[str, Any]:
+        """
+        Parse CSV/XLSX file of emails and validate each against SVARP User Portal
+        and existing enrollments.
+        """
+        exam = db.query(Exam).filter(Exam.id == exam_id, Exam.is_deleted == False).first()
+        if not exam:
+            raise ValueError("Exam not found")
+
+        emails = self._parse_emails_from_file(file_bytes, filename)
+        if not emails:
+            raise ValueError("No email addresses found in the uploaded file.")
+
+        valid_candidates = []
+        already_enrolled = []
+        invalid_candidates = []
+
+        # Get set of emails already actively enrolled in this exam
+        enrolled_db = (
+            db.query(Enrollment.student_email, Enrollment.student_id)
+            .filter(
+                Enrollment.exam_id == exam_id,
+                Enrollment.status == EnrollmentStatus.ENROLLED,
+            )
+            .all()
+        )
+        enrolled_emails_set = {
+            row[0].strip().lower() for row in enrolled_db if row[0]
+        }
+        enrolled_ids_set = {
+            str(row[1]) for row in enrolled_db if row[1]
+        }
+
+        email_regex = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+        for email in emails:
+            clean_email = email.strip().lower()
+            if not email_regex.match(clean_email):
+                invalid_candidates.append({
+                    "email": clean_email,
+                    "status": "invalid",
+                    "reason": "Invalid email syntax/format",
+                })
+                continue
+
+            if clean_email in enrolled_emails_set:
+                already_enrolled.append({
+                    "email": clean_email,
+                    "status": "already_enrolled",
+                    "reason": "Already enrolled in this exam",
+                })
+                continue
+
+            # Check with SVARP User Portal
+            try:
+                user_data = portal_user_client.get_user(email=clean_email)
+            except Exception:
+                user_data = None
+
+            if not user_data:
+                invalid_candidates.append({
+                    "email": clean_email,
+                    "status": "invalid",
+                    "reason": "Not registered in SVARP User Portal",
+                })
+                continue
+
+            if not user_data.get("is_active", True):
+                invalid_candidates.append({
+                    "email": clean_email,
+                    "full_name": user_data.get("full_name"),
+                    "status": "invalid",
+                    "reason": "User account is marked inactive in portal",
+                })
+                continue
+
+            uid_str = str(user_data.get("user_id"))
+            if uid_str in enrolled_ids_set:
+                already_enrolled.append({
+                    "email": clean_email,
+                    "full_name": user_data.get("full_name"),
+                    "user_id": UUID(uid_str),
+                    "status": "already_enrolled",
+                    "reason": "User ID already enrolled in this exam",
+                })
+                continue
+
+            valid_candidates.append({
+                "email": clean_email,
+                "user_id": UUID(uid_str),
+                "full_name": user_data.get("full_name"),
+                "status": "valid",
+                "reason": None,
+            })
+
+        return {
+            "total_found": len(emails),
+            "valid_count": len(valid_candidates),
+            "already_enrolled_count": len(already_enrolled),
+            "invalid_count": len(invalid_candidates),
+            "valid_candidates": valid_candidates,
+            "already_enrolled": already_enrolled,
+            "invalid_candidates": invalid_candidates,
+        }
 
     def generate_paper_for_attempt(
         self, db: Session, exam_id: UUID, student_id: UUID

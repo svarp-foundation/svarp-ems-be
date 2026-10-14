@@ -57,6 +57,24 @@ class EnrollmentBatchCreate(BaseModel):
     students: List[EnrollmentCreate]
 
 
+class CandidateValidationItem(BaseModel):
+    email: str
+    user_id: Optional[UUID] = None
+    full_name: Optional[str] = None
+    status: str  # "valid", "already_enrolled", "invalid"
+    reason: Optional[str] = None
+
+
+class EnrollmentFileValidationResponse(BaseModel):
+    total_found: int
+    valid_count: int
+    already_enrolled_count: int
+    invalid_count: int
+    valid_candidates: List[CandidateValidationItem]
+    already_enrolled: List[CandidateValidationItem]
+    invalid_candidates: List[CandidateValidationItem]
+
+
 class EnrollmentResponse(BaseModel):
     id: UUID
     exam_id: UUID
@@ -114,6 +132,9 @@ class ExamUpdate(BaseModel):
     shuffle_options: Optional[bool] = None
     pass_percentage: Optional[float] = None
     instructions: Optional[str] = None
+    easy_percentage: Optional[float] = None
+    medium_percentage: Optional[float] = None
+    hard_percentage: Optional[float] = None
     exam_streams: Optional[List[ExamStreamCreate]] = None
 
 
