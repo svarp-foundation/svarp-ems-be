@@ -82,6 +82,19 @@ def get_exam(
     return exam
 
 
+@router.get("/{exam_id}/syllabus")
+def get_exam_syllabus(
+    exam_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Retrieve structured syllabus and blueprint specification for an examination."""
+    try:
+        return exam_service.generate_exam_syllabus(db, exam_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.patch("/{exam_id}", response_model=ExamResponse)
 def update_exam(
     exam_id: UUID,

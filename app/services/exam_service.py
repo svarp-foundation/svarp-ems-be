@@ -1119,5 +1119,137 @@ class ExamService:
             questions=simulated_questions,
         )
 
+    def generate_exam_syllabus(self, db: Session, exam_id: UUID) -> Dict[str, Any]:
+        """
+        Generate detailed, structured curriculum syllabus and blueprint specification
+        for an exam, including subject weightages, topics, and difficulty distribution.
+        """
+        from app.models.question import Question, QuestionStatus
+        from app.models.stream import Stream
+
+        exam = db.query(Exam).filter(Exam.id == exam_id).first()
+        if not exam:
+            raise ValueError("Exam not found")
+
+        exam_data = self.get_exam(db, exam_id)
+        
+        # Calculate total marks and per-stream statistics
+        total_calculated_marks = 0.0
+        streams_syllabus = []
+
+        for es in exam_data.get("exam_streams", []):
+            sid = es.get("stream_id")
+            stream_obj = db.query(Stream).filter(Stream.id == sid).first()
+            
+            # Fetch distinct tags / topics used by active questions in this stream
+            q_tags_rows = (
+                db.query(Question.tags)
+                .filter(
+                    Question.stream_id == sid,
+                    Question.status == QuestionStatus.ACTIVE,
+                )
+                .all()
+            )
+            distinct_tags = set()
+            for row in q_tags_rows:
+                if row[0] and isinstance(row[0], list):
+                    for t in row[0]:
+                        if t and str(t).strip():
+                            distinct_tags.add(str(t).strip())
+
+            q_count = es.get("question_count") or 0
+            mpq = es.get("marks_per_question") if es.get("marks_per_question") is not None else (exam.default_marks_per_question or 1.0)
+            neg = es.get("negative_marks") if es.get("negative_marks") is not None else (exam.default_negative_marks or 0.0)
+            stream_marks = float(q_count * mpq)
+            total_calculated_marks += stream_marks
+
+            # Quotas map
+            quota_map = {"easy": 0, "medium": 0, "hard": 0}
+            for dq in es.get("difficulty_quotas", []):
+                diff = str(dq.get("difficulty", "")).lower()
+                if diff in quota_map:
+                    quota_map[diff] = dq.get("quota_count") or 0
+
+            streams_syllabus.append({
+                "stream_id": str(sid),
+                "stream_name": stream_obj.name if stream_obj else es.get("stream_name", "Subject"),
+                "stream_code": stream_obj.code if stream_obj else es.get("stream_code", "STREAM"),
+                "description": stream_obj.description if stream_obj else None,
+                "question_count": q_count,
+                "marks_per_question": mpq,
+                "negative_marks": neg,
+                "total_marks": stream_marks,
+                "weightage_pct": round((q_count / exam.total_questions * 100), 1) if exam.total_questions else 0.0,
+                "difficulty_distribution": quota_map,
+                "topics": sorted(list(distinct_tags)),
+            })
+
+        # Generate markdown syllabus text
+        md_lines = [
+            f"# Examination Syllabus & Assessment Blueprint",
+            f"## {exam.title}",
+            f"",
+            f"**Organization:** SVARP Assessment & Examination Authority  ",
+            f"**Total Questions:** {exam.total_questions} MCQs  ",
+            f"**Total Duration:** {exam.duration_minutes} Minutes  ",
+            f"**Maximum Marks:** {total_calculated_marks} Marks  ",
+            f"**Default Marking Scheme:** +{exam.default_marks_per_question} / -{exam.default_negative_marks} Marks  ",
+            f"**Qualifying Pass Standard:** {exam.pass_percentage or 50.0}%  ",
+            f"",
+            f"---",
+            f"### Sectional Distribution & Weightage",
+            f"",
+            f"| Section Code | Subject Stream | Questions | Marks | Weightage | Difficulty (Easy/Med/Hard) |",
+            f"|:---|:---|:---:|:---:|:---:|:---:|",
+        ]
+        for s in streams_syllabus:
+            diff_str = f"{s['difficulty_distribution']['easy']} / {s['difficulty_distribution']['medium']} / {s['difficulty_distribution']['hard']}"
+            md_lines.append(
+                f"| `{s['stream_code']}` | **{s['stream_name']}** | {s['question_count']} | {s['total_marks']} | {s['weightage_pct']}% | {diff_str} |"
+            )
+
+        md_lines.extend([
+            f"",
+            f"---",
+            f"### Detailed Curriculum & Topics by Section",
+            f"",
+        ])
+        for s in streams_syllabus:
+            md_lines.append(f"#### {s['stream_name']} (`{s['stream_code']}`)")
+            if s['description']:
+                md_lines.append(f"*{s['description']}*  ")
+            md_lines.append(f"- **Questions Allocated:** {s['question_count']} ({s['weightage_pct']}% of paper)")
+            md_lines.append(f"- **Marks per Question:** +{s['marks_per_question']} | **Negative:** -{s['negative_marks']}")
+            if s['topics']:
+                md_lines.append(f"- **Core Topics Covered:** {', '.join(s['topics'])}")
+            else:
+                md_lines.append(f"- **Core Topics Covered:** Comprehensive domain fundamentals & applied concepts")
+            md_lines.append("")
+
+        md_lines.extend([
+            f"---",
+            f"### Examination Rules & Instructions",
+            f"",
+            f"1. **Question Pattern:** All questions are objective Multiple Choice Questions (Single Option Correct).",
+            f"2. **Timing Policy:** The assessment timer runs continuously for {exam.duration_minutes} minutes upon starting.",
+            f"3. **Security & Proctoring:** Fullscreen mode is strictly mandatory. Leaving the browser window or switching tabs will immediately lock the session on the 1st violation.",
+            f"4. **Autosave Guarantee:** Every selected answer is encrypted and synced to cloud storage instantaneously.",
+        ])
+
+        return {
+            "exam_id": str(exam.id),
+            "title": exam.title,
+            "description": exam.description,
+            "duration_minutes": exam.duration_minutes,
+            "total_questions": exam.total_questions,
+            "total_marks": total_calculated_marks,
+            "default_marks_per_question": exam.default_marks_per_question,
+            "default_negative_marks": exam.default_negative_marks,
+            "pass_percentage": exam.pass_percentage,
+            "instructions": exam.instructions,
+            "streams": streams_syllabus,
+            "markdown_content": "\n".join(md_lines),
+        }
+
 
 exam_service = ExamService()
