@@ -5,7 +5,7 @@ All auth, user lookup, and permission checks go through here.
 
 import time
 from threading import Lock
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from uuid import UUID
 import httpx
 from app.core.config import settings
@@ -56,7 +56,7 @@ class PortalUserClient:
             timeout=httpx.Timeout(10.0, connect=5.0),
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
-        self._cache = TTLCache(ttl_seconds=20.0)
+        self._cache = TTLCache(ttl_seconds=300.0)
 
     def _headers_key_only(self) -> Dict[str, str]:
         """Headers for endpoints requiring only API key."""
@@ -122,19 +122,26 @@ class PortalUserClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch user info from portal-user.
-        Caches results for 20s.
+        Caches results for 5 minutes.
         Returns: {"user_id", "email", "full_name", "is_active", "roles", ...}
         """
-        cache_key = f"user_{str(user_id) if user_id else ''}_{email or ''}"
+        clean_email = email.strip().lower() if email else ""
+        cache_key = f"user_{str(user_id) if user_id else ''}_{clean_email}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
+        # Check secondary key by email directly
+        if clean_email:
+            email_cached = self._cache.get(f"user__{clean_email}")
+            if email_cached is not None:
+                return email_cached
+
         params = {}
         if user_id:
             params["user_id"] = str(user_id)
-        if email:
-            params["email"] = email
+        if clean_email:
+            params["email"] = clean_email
 
         try:
             response = self._client.get(
@@ -147,9 +154,51 @@ class PortalUserClient:
             data = response.json()
             if data:
                 self._cache.set(cache_key, data)
+                if data.get("user_id"):
+                    self._cache.set(f"user_{str(data['user_id'])}_", data)
+                if data.get("email"):
+                    self._cache.set(f"user__{str(data['email']).strip().lower()}", data)
             return data
         except Exception:
             return None
+
+    def get_users_bulk(
+        self, emails: List[str], max_workers: int = 10
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Fetch multiple users in parallel using ThreadPoolExecutor and connection pooling.
+        Substantially accelerates bulk candidate validation and enrollment.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        results: Dict[str, Optional[Dict[str, Any]]] = {}
+        missing_emails: List[str] = []
+
+        # 1. Fast in-memory cache lookup
+        for raw_email in emails:
+            clean = (raw_email or "").strip().lower()
+            if not clean:
+                continue
+            cached = self._cache.get(f"user__{clean}")
+            if cached is not None:
+                results[clean] = cached
+            else:
+                missing_emails.append(clean)
+
+        if not missing_emails:
+            return results
+
+        # 2. Concurrently fetch missing users over HTTP pool
+        def _fetch_one(em: str) -> tuple:
+            return em, self.get_user(email=em)
+
+        workers = min(max_workers, len(missing_emails))
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            fetched = executor.map(_fetch_one, missing_emails)
+            for em, data in fetched:
+                results[em] = data
+
+        return results
 
     def get_permissions(
         self,

@@ -13,22 +13,51 @@ from app.services.background_tasks import background_monitor_loop, MONITOR_STATS
 import app.models  # noqa: F401
 
 
+import fcntl
+
+_monitor_lock_file = None
+
+def _acquire_singleton_lock() -> bool:
+    """Acquire a non-blocking process lock so only ONE worker runs background tasks."""
+    global _monitor_lock_file
+    try:
+        lock_path = "/tmp/portal_exam_monitor.lock"
+        _monitor_lock_file = open(lock_path, "w")
+        fcntl.flock(_monitor_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (IOError, OSError):
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Create all tables on startup
-    Base.metadata.create_all(bind=engine)
+    monitor_task = None
+    is_leader = _acquire_singleton_lock()
 
-    # 2. Start background monitor task (auto-submits expired attempts, enforces timeouts)
-    monitor_task = asyncio.create_task(background_monitor_loop(interval_seconds=15))
+    if is_leader:
+        # 1. Create all tables on startup (only leader worker)
+        Base.metadata.create_all(bind=engine)
+
+        # 2. Start background monitor task (auto-submits expired attempts, enforces timeouts)
+        monitor_task = asyncio.create_task(background_monitor_loop(interval_seconds=20))
 
     yield
 
     # 3. Clean cancellation on shutdown
-    monitor_task.cancel()
-    try:
-        await monitor_task
-    except asyncio.CancelledError:
-        pass
+    if monitor_task:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+    global _monitor_lock_file
+    if _monitor_lock_file:
+        try:
+            fcntl.flock(_monitor_lock_file, fcntl.LOCK_UN)
+            _monitor_lock_file.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(

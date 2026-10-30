@@ -78,8 +78,9 @@ def sweep_stale_heartbeats(db: Session) -> int:
     Locks the attempt to prevent unauthorized offline tampering.
     """
     now = datetime.now(timezone.utc)
-    # Grace period: 2x the configured heartbeat timeout (e.g. 120s if timeout is 60s)
-    threshold = timedelta(seconds=max(30, settings.HEARTBEAT_TIMEOUT_SECONDS * 2))
+    # Resilient grace period: at least 300 seconds (5 minutes) or 4x the heartbeat timeout
+    # Prevents transient local network lag or temporary client freezes from locking active exams
+    threshold = timedelta(seconds=max(300, settings.HEARTBEAT_TIMEOUT_SECONDS * 4))
 
     stale_cutoff = now - threshold
     stale_attempts = (

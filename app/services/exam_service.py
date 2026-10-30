@@ -9,6 +9,7 @@ import re
 import openpyxl
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
+import uuid
 from uuid import UUID
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, text
@@ -521,17 +522,35 @@ class ExamService:
         if not exam:
             raise ValueError("Exam not found")
 
+        # 1. Single query for all existing enrollments on this exam
+        existing_enrollments = (
+            db.query(Enrollment)
+            .filter(Enrollment.exam_id == exam_id)
+            .all()
+        )
+        existing_by_email = {
+            e.student_email.strip().lower(): e for e in existing_enrollments if e.student_email
+        }
+        existing_by_id = {
+            str(e.student_id): e for e in existing_enrollments if e.student_id
+        }
+
+        # 2. Bulk resolve users concurrently (hits 5-minute memory cache from validation step)
+        emails_to_fetch = [
+            s_email.strip().lower() for _, s_email in students if s_email and s_email.strip()
+        ]
+        users_map = portal_user_client.get_users_bulk(emails_to_fetch, max_workers=10)
+
         new_count = 0
         for student_id, student_email in students:
             clean_email = (student_email or "").strip().lower()
             if not clean_email:
                 continue
 
-            # Verify against SVARP Central User Portal
-            user_data = portal_user_client.get_user(
-                user_id=student_id if student_id else None,
-                email=clean_email,
-            )
+            user_data = users_map.get(clean_email)
+            if not user_data and student_id:
+                user_data = portal_user_client.get_user(user_id=student_id)
+
             if not user_data:
                 raise ValueError(
                     f"Candidate '{student_email.strip()}' does not exist in SVARP User Portal. "
@@ -544,32 +563,26 @@ class ExamService:
                 )
 
             verified_student_id = UUID(user_data["user_id"])
+            verified_student_id_str = str(verified_student_id)
             verified_email = user_data.get("email", clean_email).strip()
 
-            existing = (
-                db.query(Enrollment)
-                .filter(
-                    Enrollment.exam_id == exam_id,
-                    (Enrollment.student_id == verified_student_id)
-                    | (func.lower(Enrollment.student_email) == clean_email),
-                )
-                .with_for_update(skip_locked=True)
-                .first()
-            )
+            existing = existing_by_email.get(clean_email) or existing_by_id.get(verified_student_id_str)
             if not existing:
                 enrollment = Enrollment(
+                    id=uuid.uuid4(),
                     exam_id=exam_id,
                     student_id=verified_student_id,
                     student_email=verified_email,
                     status=EnrollmentStatus.ENROLLED,
                 )
                 db.add(enrollment)
+                existing_by_email[clean_email] = enrollment
+                existing_by_id[verified_student_id_str] = enrollment
                 new_count += 1
             else:
                 existing.status = EnrollmentStatus.ENROLLED
                 existing.student_id = verified_student_id
                 existing.student_email = verified_email
-                # Re-activation of withdrawn enrollment; not counted as newly enrolled
 
         db.commit()
         return new_count
@@ -710,6 +723,13 @@ class ExamService:
 
         email_regex = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
+        # Prefetch valid candidate users concurrently using connection pool and local cache
+        candidate_emails_to_lookup = [
+            e.strip().lower() for e in emails 
+            if email_regex.match(e.strip().lower()) and e.strip().lower() not in enrolled_emails_set
+        ]
+        users_map = portal_user_client.get_users_bulk(candidate_emails_to_lookup, max_workers=10)
+
         for email in emails:
             clean_email = email.strip().lower()
             if not email_regex.match(clean_email):
@@ -728,11 +748,7 @@ class ExamService:
                 })
                 continue
 
-            # Check with SVARP User Portal
-            try:
-                user_data = portal_user_client.get_user(email=clean_email)
-            except Exception:
-                user_data = None
+            user_data = users_map.get(clean_email)
 
             if not user_data:
                 invalid_candidates.append({
@@ -962,7 +978,9 @@ class ExamService:
                     f"Question {q_obj.id} has no valid version. Cannot generate paper."
                 )
 
+            att_q_id = uuid.uuid4()
             att_question = AttemptQuestion(
+                id=att_q_id,
                 attempt_id=attempt.id,
                 question_version_id=version_id,
                 stream_id=item["stream_id"],
@@ -971,7 +989,6 @@ class ExamService:
                 negative_marks=item["negative_marks"],
             )
             db.add(att_question)
-            db.flush()
 
             # Options
             original_options = list(current_version.options)
@@ -983,7 +1000,8 @@ class ExamService:
             for opt_idx, orig_opt in enumerate(original_options):
                 lbl = display_labels[opt_idx] if opt_idx < len(display_labels) else orig_opt.option_label
                 att_option = AttemptOption(
-                    attempt_question_id=att_question.id,
+                    id=uuid.uuid4(),
+                    attempt_question_id=att_q_id,
                     original_option_id=orig_opt.id,
                     display_order=opt_idx + 1,
                     display_label=lbl,

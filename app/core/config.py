@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     PORTAL_USER_BASE_URL: str
     PORTAL_USER_API_KEY: str
     PORTAL_USER_API_SECRET: str
+    JWT_SECRET_KEY: str = "e2c06f3f063fe3f8cc16ce19cc1c216efb9419b874bde5fbbfd140086458972f"
+    JWT_ALGORITHM: str = "HS256"
 
     # Session Config
     HEARTBEAT_TIMEOUT_SECONDS: int = 60

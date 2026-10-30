@@ -9,3 +9,4 @@ httpx
 python-multipart
 email-validator
 openpyxl
+pyjwt
